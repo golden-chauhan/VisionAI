@@ -1,44 +1,68 @@
 
+import os
+import time
 from pathlib import Path
 from uuid import uuid4
-import time
 
 import cv2
 import numpy as np
-from flask import (
-    Flask, Response, jsonify, request,
-    send_from_directory, url_for
-)
+
+from flask import Flask, Response, jsonify, request, send_from_directory, url_for
 from flask_cors import CORS
 from werkzeug.utils import secure_filename
 
 from detector import detect_frame, device_info
-from camera_manager import CameraManager
 
+
+# ============================================================
+# APPLICATION CONFIGURATION
+# ============================================================
 
 app = Flask(__name__)
-CORS(app)
 
 BASE_DIR = Path(__file__).resolve().parent
 UPLOAD_DIR = BASE_DIR / "uploads"
 OUTPUT_DIR = BASE_DIR / "outputs"
 
-UPLOAD_DIR.mkdir(exist_ok=True)
-OUTPUT_DIR.mkdir(exist_ok=True)
+UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 app.config["MAX_CONTENT_LENGTH"] = 200 * 1024 * 1024
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp"}
 VIDEO_EXTENSIONS = {".mp4", ".avi", ".mov", ".mkv"}
 
-camera_manager = CameraManager(detect_frame)
+# Only allow requests from explicitly approved frontend origins.
+# Configure CORS_ORIGINS in the cloud hosting environment.
+ALLOWED_ORIGINS = [
+    origin.strip().rstrip("/")
+    for origin in os.getenv(
+        "CORS_ORIGINS",
+        "http://localhost:5173,http://127.0.0.1:5173"
+    ).split(",")
+    if origin.strip()
+]
 
+CORS(
+    app,
+    resources={
+        r"/api/*": {
+            "origins": ALLOWED_ORIGINS,
+            "methods": ["GET", "POST", "OPTIONS"],
+            "allow_headers": ["Content-Type"],
+            "max_age": 600,
+        }
+    },
+)
+
+
+# ============================================================
+# COMMON UTILITIES
+# ============================================================
 
 def parse_confidence(value, default=0.35):
     try:
-        confidence = float(
-            default if value is None else value
-        )
+        confidence = float(default if value is None else value)
     except (ValueError, TypeError):
         raise ValueError(
             "Confidence must be between 0.05 and 0.95."
@@ -56,7 +80,9 @@ def decode_uploaded_image():
     file = request.files.get("file")
 
     if file is None:
-        raise ValueError("Upload an image using the file field.")
+        raise ValueError(
+            "Upload an image using the file field."
+        )
 
     raw = np.frombuffer(file.read(), dtype=np.uint8)
 
@@ -71,6 +97,20 @@ def decode_uploaded_image():
     return frame
 
 
+def cctv_disabled_response():
+    return jsonify({
+        "status": "unavailable",
+        "error": (
+            "Public CCTV monitoring is temporarily disabled. "
+            "Secure registered-user camera sessions are under development."
+        )
+    }), 503
+
+
+# ============================================================
+# HEALTH CHECK
+# ============================================================
+
 @app.get("/api/health")
 def health():
     return jsonify({
@@ -79,9 +119,17 @@ def health():
     })
 
 
+# ============================================================
+# GENERATED OUTPUT FILES
+# ============================================================
+
 @app.get("/api/outputs/<path:filename>")
 def get_output(filename):
-    return send_from_directory(OUTPUT_DIR, filename)
+    return send_from_directory(
+        OUTPUT_DIR,
+        filename,
+        as_attachment=False
+    )
 
 
 # ============================================================
@@ -109,15 +157,22 @@ def detect_image():
             request.form.get("confidence")
         )
         frame = decode_uploaded_image()
+
     except ValueError as exc:
         return jsonify({"error": str(exc)}), 400
 
     start = time.perf_counter()
+
     annotated, stats = detect_frame(frame, confidence)
+
     elapsed = (time.perf_counter() - start) * 1000
 
     output_name = f"{uuid4().hex}.jpg"
-    success, encoded = cv2.imencode(".jpg", annotated)
+
+    success, encoded = cv2.imencode(
+        ".jpg",
+        annotated
+    )
 
     if not success:
         return jsonify({
@@ -141,30 +196,36 @@ def detect_image():
 
 
 # ============================================================
-# OPTIMIZED WEBCAM DETECTION
+# BROWSER WEBCAM DETECTION
 # ============================================================
 
 @app.post("/api/detect/frame")
 def detect_webcam_frame():
     """
-    Return only detection metadata.
+    Process one browser webcam frame.
 
-    Unlike /api/detect/image, this endpoint does not
-    save an annotated JPEG to the outputs directory.
-    React draws the boxes on its own transparent canvas.
+    Returns detection metadata only.
+    React draws the bounding boxes on its own canvas.
     """
+
     try:
         confidence = parse_confidence(
             request.form.get("confidence")
         )
+
         frame = decode_uploaded_image()
+
     except ValueError as exc:
         return jsonify({"error": str(exc)}), 400
 
     height, width = frame.shape[:2]
 
     if width > 640:
-        new_height = max(1, round(height * 640 / width))
+        new_height = max(
+            1,
+            round(height * 640 / width)
+        )
+
         frame = cv2.resize(
             frame,
             (640, new_height),
@@ -209,6 +270,7 @@ def detect_video():
         confidence = parse_confidence(
             request.form.get("confidence")
         )
+
     except ValueError as exc:
         return jsonify({"error": str(exc)}), 400
 
@@ -225,7 +287,9 @@ def detect_video():
     cap = cv2.VideoCapture(str(input_path))
 
     if not cap.isOpened():
+        cap.release()
         input_path.unlink(missing_ok=True)
+
         return jsonify({
             "error": "Could not open this video."
         }), 400
@@ -245,6 +309,7 @@ def detect_video():
     ):
         cap.release()
         input_path.unlink(missing_ok=True)
+
         return jsonify({
             "error": "Invalid or excessively large video dimensions."
         }), 400
@@ -253,12 +318,14 @@ def detect_video():
         str(output_path),
         cv2.VideoWriter_fourcc(*"mp4v"),
         fps,
-        (width, height),
+        (width, height)
     )
 
     if not writer.isOpened():
         cap.release()
+        writer.release()
         input_path.unlink(missing_ok=True)
+
         return jsonify({
             "error": "Could not create output video."
         }), 500
@@ -266,8 +333,10 @@ def detect_video():
     total_frames = 0
     frames_with_people = 0
     frames_with_vehicles = 0
+
     peak_people = 0
     peak_vehicles = 0
+
     people_frame_sum = 0
     vehicle_frame_sum = 0
 
@@ -281,10 +350,12 @@ def detect_video():
                 break
 
             annotated, stats = detect_frame(
-                frame, confidence
+                frame,
+                confidence
             )
 
             writer.write(annotated)
+
             total_frames += 1
 
             people = stats["people"]
@@ -317,6 +388,7 @@ def detect_video():
         or output_path.stat().st_size == 0
     ):
         output_path.unlink(missing_ok=True)
+
         return jsonify({
             "error": "No readable frames were found."
         }), 400
@@ -326,7 +398,10 @@ def detect_video():
     return jsonify({
         "filename": filename,
         "frames_processed": total_frames,
-        "duration_seconds": round(total_frames / fps, 2),
+        "duration_seconds": round(
+            total_frames / fps,
+            2
+        ),
         "processing_seconds": round(elapsed, 2),
         "processing_fps": (
             round(total_frames / elapsed, 2)
@@ -335,10 +410,12 @@ def detect_video():
         "peak_people_in_frame": peak_people,
         "peak_vehicles_in_frame": peak_vehicles,
         "average_people_per_frame": round(
-            people_frame_sum / total_frames, 2
+            people_frame_sum / total_frames,
+            2
         ),
         "average_vehicles_per_frame": round(
-            vehicle_frame_sum / total_frames, 2
+            vehicle_frame_sum / total_frames,
+            2
         ),
         "frames_with_people": frames_with_people,
         "frames_with_vehicles": frames_with_vehicles,
@@ -352,110 +429,42 @@ def detect_video():
 
 
 # ============================================================
-# CCTV DETECTION
+# CCTV ENDPOINTS — TEMPORARILY DISABLED
 # ============================================================
+
+# The existing implementation has one global camera manager.
+# It does not provide user authentication or session isolation.
+# These endpoints remain present for compatibility with the
+# existing frontend, but no camera operations are permitted.
 
 @app.post("/api/cctv/connect")
 def cctv_connect():
-    data = request.get_json(silent=True) or {}
-    stream_url = str(
-        data.get("stream_url", "")
-    ).strip()
-
-    if not stream_url:
-        return jsonify({
-            "error": "Enter an RTSP stream URL."
-        }), 400
-
-    try:
-        confidence = parse_confidence(
-            data.get("confidence")
-        )
-
-        result = camera_manager.start(
-            stream_url,
-            confidence
-        )
-
-        return jsonify(result), 202
-
-    except ValueError as exc:
-        return jsonify({"error": str(exc)}), 400
-
-    except RuntimeError as exc:
-        return jsonify({"error": str(exc)}), 409
+    return cctv_disabled_response()
 
 
 @app.get("/api/cctv/status")
 def cctv_status():
-    return jsonify(camera_manager.status())
+    return cctv_disabled_response()
 
 
 @app.post("/api/cctv/disconnect")
 def cctv_disconnect():
-    camera_manager.stop()
-
-    return jsonify({
-        "status": "stopped",
-        "message": "CCTV stream stopped."
-    })
+    return cctv_disabled_response()
 
 
 @app.post("/api/cctv/confidence")
 def cctv_confidence():
-    data = request.get_json(silent=True) or {}
-
-    try:
-        confidence = parse_confidence(
-            data.get("confidence")
-        )
-    except ValueError as exc:
-        return jsonify({"error": str(exc)}), 400
-
-    camera_manager.set_confidence(confidence)
-
-    return jsonify({
-        "confidence": confidence
-    })
-
-
-def generate_cctv_stream():
-    last_frame_id = -1
-
-    while True:
-        frame_id, jpeg, running = (
-            camera_manager.latest_frame()
-        )
-
-        if jpeg is not None and frame_id != last_frame_id:
-            last_frame_id = frame_id
-
-            yield (
-                b"--frame\r\n"
-                b"Content-Type: image/jpeg\r\n"
-                b"Cache-Control: no-cache\r\n\r\n"
-                + jpeg
-                + b"\r\n"
-            )
-
-        elif not running:
-            break
-
-        time.sleep(0.03)
+    return cctv_disabled_response()
 
 
 @app.get("/api/cctv/stream.mjpg")
 def cctv_stream():
-    return Response(
-        generate_cctv_stream(),
-        mimetype=(
-            "multipart/x-mixed-replace; boundary=frame"
-        ),
-        headers={
-            "Cache-Control": "no-store, no-cache"
-        },
-    )
+    return cctv_disabled_response()
 
+
+# ============================================================
+# ERROR HANDLERS
+# ============================================================
 
 @app.errorhandler(413)
 def too_large(_error):
@@ -464,13 +473,21 @@ def too_large(_error):
     }), 413
 
 
+@app.errorhandler(500)
+def internal_error(_error):
+    return jsonify({
+        "error": "An internal server error occurred."
+    }), 500
+
+
+# ============================================================
+# LOCAL DEVELOPMENT STARTUP
+# ============================================================
+
 if __name__ == "__main__":
-    try:
-        app.run(
-            host="127.0.0.1",
-            port=5000,
-            debug=False,
-            threaded=True
-        )
-    finally:
-        camera_manager.stop()
+    app.run(
+        host="127.0.0.1",
+        port=int(os.getenv("PORT", "5000")),
+        debug=False,
+        threaded=True
+    )
